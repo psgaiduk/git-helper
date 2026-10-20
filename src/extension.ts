@@ -18,37 +18,65 @@ export function activate(context: vscode.ExtensionContext): void {
           if (message.command === 'generate') {
             await vscode.commands.executeCommand('smartCommit.generate');
             view.webview.postMessage({ command: 'generated' });
+          } else if (message.command === 'checkMain') {
+            try {
+              const readiness = await assertMainIsCurrent(folderPath());
+              view.webview.postMessage({ command: 'tagReadiness', ready: true, remote: readiness.remote, message: `main актуальна и синхронизирована с ${readiness.remote}. Можно создавать тег.` });
+            } catch (error) {
+              const detail = error instanceof Error ? error.message : String(error);
+              view.webview.postMessage({ command: 'tagReadiness', ready: false, message: detail });
+            }
           } else if (message.command === 'prepareTag') {
             try {
-              const folder = vscode.workspace.workspaceFolders?.[0];
-              if (!folder) throw new Error('Откройте Git-репозиторий.');
+              const cwd = folderPath();
+              await assertMainIsCurrent(cwd);
               const apiKey = await context.secrets.get(apiKeyStorageKey);
               const description = await vscode.window.withProgress(
                 { location: vscode.ProgressLocation.Notification, title: 'Готовим описание тега…', cancellable: false },
                 async () => {
-                  const log = await commitsSincePreviousTag(folder.uri.fsPath);
+                  const log = await commitsSincePreviousTag(cwd, 'main');
                   return generateTagDescription(log, apiKey);
                 }
               );
               view.webview.postMessage({ command: 'tagDescriptionReady', description });
             } catch (error) {
               const detail = error instanceof Error ? error.message : String(error);
-              view.webview.postMessage({ command: 'tagError', message: detail });
+              if (error instanceof TagReadinessError) {
+                view.webview.postMessage({ command: 'tagReadiness', ready: false, message: detail });
+              } else {
+                view.webview.postMessage({ command: 'tagError', message: detail });
+              }
             }
           } else if (message.command === 'createTag') {
             try {
-              const folder = vscode.workspace.workspaceFolders?.[0];
-              if (!folder) throw new Error('Откройте Git-репозиторий.');
+              const cwd = folderPath();
+              const readiness = await assertMainIsCurrent(cwd);
               const name = String(message.name ?? '').trim();
               const description = String(message.description ?? '').trim();
               if (!name) throw new Error('Укажите имя тега.');
               if (!description) throw new Error('Добавьте описание тега.');
-              await execFileAsync('git', ['check-ref-format', `refs/tags/${name}`], { cwd: folder.uri.fsPath });
-              await execFileAsync('git', ['tag', '-a', name, '-m', description], { cwd: folder.uri.fsPath });
-              view.webview.postMessage({ command: 'tagCreated', name });
+              await vscode.window.withProgress(
+                { location: vscode.ProgressLocation.Notification, title: `Создаём аннотированный тег ${name} и отправляем его…`, cancellable: false },
+                async () => {
+                  await execFileAsync('git', ['check-ref-format', `refs/tags/${name}`], { cwd });
+                  await execFileAsync('git', ['tag', '-a', name, 'main', '-m', description], { cwd });
+                  try {
+                    await execFileAsync('git', ['push', '--porcelain', readiness.remote, `refs/tags/${name}`], { cwd, maxBuffer: 2 * 1024 * 1024 });
+                  } catch (error) {
+                    throw new TagPushError(name, readiness.remote, error instanceof Error ? error.message : String(error));
+                  }
+                }
+              );
+              view.webview.postMessage({ command: 'tagCreated', name, remote: readiness.remote });
             } catch (error) {
               const detail = error instanceof Error ? error.message : String(error);
-              view.webview.postMessage({ command: 'tagError', message: detail });
+              if (error instanceof TagPushError) {
+                view.webview.postMessage({ command: 'tagPushError', name: error.tagName, remote: error.remote, message: error.message });
+              } else if (error instanceof TagReadinessError) {
+                view.webview.postMessage({ command: 'tagReadiness', ready: false, message: detail });
+              } else {
+                view.webview.postMessage({ command: 'tagError', message: detail });
+              }
             }
           } else if (message.command === 'openSettings') {
             await vscode.commands.executeCommand('workbench.action.openSettings', 'smartCommit');
@@ -186,6 +214,7 @@ function settingsHtml(webview: vscode.Webview, hasApiKey: boolean): string {
     .tag-card h2 { margin: 0 0 5px; font-size: 12px; text-transform: none; letter-spacing: 0; }
     .tag-card .hero-copy { margin-bottom: 10px; }
     .tag-description-label { margin-top: 12px; }
+    .tag-lock { margin: 9px 1px; color: var(--vscode-descriptionForeground); font-size: 10px; line-height: 1.5; }
     textarea { display: block; width: 100%; min-height: 112px; margin-top: 10px; padding: 8px; resize: vertical; border: 1px solid var(--vscode-input-border, var(--vscode-widget-border)); border-radius: 5px; color: var(--vscode-input-foreground); background: var(--vscode-input-background); font: inherit; line-height: 1.5; }
     textarea:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
   </style>
@@ -207,12 +236,16 @@ function settingsHtml(webview: vscode.Webview, hasApiKey: boolean): string {
   </section>
   <section class="tag-card">
     <h2>Создать тег релиза</h2>
-    <p class="hero-copy">Соберём изменения после предыдущего тега и подготовим описание на русском.</p>
+    <p class="hero-copy">Тег и описание будут созданы для актуальной ветки main. Влитые ветки учитываются.</p>
+    <p id="tagLock" class="tag-lock">Сначала проверьте, что вы на main и локальная ветка синхронизирована с remote.</p>
+    <button id="checkMain" class="secondary">Проверить main</button>
+    <div id="tagControls" hidden>
     <div class="field"><label for="tagName">Имя тега</label><input id="tagName" type="text" placeholder="Например, v1.2.0"></div>
     <button id="prepareTag" class="secondary">Составить описание</button>
     <label class="tag-description-label" for="tagDescription">Описание тега</label>
     <textarea id="tagDescription" placeholder="Здесь появится описание изменений. Его можно отредактировать перед созданием тега."></textarea>
     <button id="createTag" disabled>Создать аннотированный тег</button>
+    </div>
   </section>
   </main>
   <main id="settingsTab" hidden>
@@ -247,12 +280,15 @@ function settingsHtml(webview: vscode.Webview, hasApiKey: boolean): string {
     const tagName = document.getElementById('tagName');
     const createTagButton = document.getElementById('createTag');
     const updateCreateTag = () => { createTagButton.disabled = !tagName.value.trim() || !tagDescription.value.trim(); };
+    document.getElementById('checkMain').addEventListener('click', event => {
+      event.currentTarget.disabled = true; document.getElementById('tagLock').textContent = 'Проверяем main и обновления с remote…'; vscode.postMessage({ command: 'checkMain' });
+    });
     tagName.addEventListener('input', updateCreateTag);
     tagDescription.addEventListener('input', updateCreateTag);
     document.getElementById('prepareTag').addEventListener('click', event => {
       event.currentTarget.disabled = true; status.textContent = 'Анализируем историю коммитов…'; vscode.postMessage({ command: 'prepareTag' });
     });
-    createTagButton.addEventListener('click', () => { createTagButton.disabled = true; status.textContent = 'Создаём тег…'; vscode.postMessage({ command: 'createTag', name: tagName.value, description: tagDescription.value }); });
+    createTagButton.addEventListener('click', () => { createTagButton.disabled = true; status.textContent = 'Создаём аннотированный тег и отправляем его в remote…'; vscode.postMessage({ command: 'createTag', name: tagName.value, description: tagDescription.value }); });
     document.getElementById('settings').addEventListener('click', () => vscode.postMessage({ command: 'openSettings' }));
     document.getElementById('save').addEventListener('click', () => { status.textContent = 'Сохраняем в пользовательские настройки…'; vscode.postMessage({ command: 'save', apiUrl: document.getElementById('apiUrl').value, model: document.getElementById('model').value, apiKey: document.getElementById('apiKey').value }); });
     document.getElementById('removeKey').addEventListener('click', () => { status.textContent = 'Сохраняем настройки…'; vscode.postMessage({ command: 'save', apiUrl: document.getElementById('apiUrl').value, model: document.getElementById('model').value, removeApiKey: true }); });
@@ -264,8 +300,15 @@ function settingsHtml(webview: vscode.Webview, hasApiKey: boolean): string {
       }
       if (event.data.command === 'saveError') { status.textContent = 'Ошибка сохранения: ' + event.data.message; }
       if (event.data.command === 'generated') { generateButton.disabled = false; status.textContent = 'Готово. Проверьте сообщение в Source Control.'; }
+      if (event.data.command === 'tagReadiness') {
+        document.getElementById('checkMain').disabled = false;
+        document.getElementById('tagControls').hidden = !event.data.ready;
+        document.getElementById('tagLock').textContent = event.data.message;
+        if (!event.data.ready) status.textContent = 'Создание тега недоступно. Перейдите на main и обновите код.';
+      }
       if (event.data.command === 'tagDescriptionReady') { document.getElementById('prepareTag').disabled = false; tagDescription.value = event.data.description; updateCreateTag(); status.textContent = 'Описание готово. Проверьте его и создайте тег.'; }
-      if (event.data.command === 'tagCreated') { status.textContent = 'Тег ' + event.data.name + ' создан.'; createTagButton.disabled = false; }
+      if (event.data.command === 'tagCreated') { status.textContent = 'Аннотированный тег ' + event.data.name + ' создан для main и отправлен в ' + event.data.remote + '.'; createTagButton.disabled = true; }
+      if (event.data.command === 'tagPushError') { status.textContent = 'Тег ' + event.data.name + ' создан локально, но не отправлен: ' + event.data.message + '. Повторите: git push ' + event.data.remote + ' refs/tags/' + event.data.name; }
       if (event.data.command === 'tagError') { document.getElementById('prepareTag').disabled = false; updateCreateTag(); status.textContent = event.data.message; }
     });
   </script>
@@ -287,7 +330,7 @@ async function commitsSincePreviousTag(cwd: string): Promise<string> {
   }
 
   const range = previousTag ? `${previousTag}..HEAD` : 'HEAD';
-  const result = await execFileAsync('git', ['log', '--max-count=500', '--decorate=short', '--format=%h %d%n%s%n%b', range], { cwd, maxBuffer: 8 * 1024 * 1024 });
+  const result = await execFileAsync('git', ['log', '--max-count=500', '--decorate=short', '--format=%h%x09%d%x09%s%n%b%n---', range], { cwd, maxBuffer: 8 * 1024 * 1024 });
   const log = result.stdout.trim();
   if (!log) throw new Error('После предыдущего тега нет коммитов для описания.');
   return `Диапазон: ${previousTag ? `${previousTag}..HEAD` : 'вся история до HEAD'}\n\n${log.slice(0, 60_000)}`;
@@ -311,7 +354,7 @@ async function generateTagDescription(commitLog: string, apiKey: string | undefi
       messages: [
         {
           role: 'system',
-          content: 'Составь описание Git-тега на русском языке по истории коммитов между предыдущим тегом и текущим HEAD. Кратко перечисли задачи и что сделано по каждой, сгруппируй близкие изменения. Используй понятный Markdown со списком. Учитывай названия тегов и веток в истории как контекст, но не выдумывай задачи. Если коммитов недостаточно для вывода, честно укажи это. Верни только готовое описание релиза.'
+          content: 'По истории коммитов составь список выполненных задач на русском языке. В истории есть коммиты из всех веток, влитых в текущую ветку за период. Найди ID задач в названиях веток, сообщениях merge-коммитов, заголовках и телах коммитов. Сгруппируй изменения по ID задачи и опиши результат каждой задачи одной очень короткой строкой не длиннее 150 символов, включая ID. Формат каждой строки строго: M-1: Сделано ... Верни только строки задач без заголовка, вступления, Markdown-маркеров и заключения. Не придумывай ID и содержание; если ID не найден, используй «Без задачи: ...».'
         },
         { role: 'user', content: `История коммитов текущей ветки:\n${commitLog}` }
       ]
@@ -323,9 +366,30 @@ async function generateTagDescription(commitLog: string, apiKey: string | undefi
     error?: { message?: string };
   };
   if (!response.ok) throw new Error(payload.error?.message ?? `API вернул HTTP ${response.status}`);
-  const description = payload.choices?.[0]?.message?.content?.trim();
-  if (!description) throw new Error('API вернул пустое описание.');
-  return description;
+  const responseText = payload.choices?.[0]?.message?.content?.trim();
+  if (!responseText) throw new Error('API вернул пустое описание.');
+  return normalizeTagDescription(responseText);
+}
+
+function normalizeTagDescription(responseText: string): string {
+  const tasks = new Map<string, string>();
+  for (const sourceLine of responseText.split(/\r?\n/)) {
+    const line = sourceLine.replace(/^\s*(?:[-*•]\s*)?/, '').trim();
+    const match = line.match(/^((?:[\p{L}][\p{L}\d]*(?:-[\p{L}\d]+)+)|Без задачи)\s*:\s*(.+)$/iu);
+    if (!match) continue;
+    const id = match[1].toLocaleLowerCase('ru-RU') === 'без задачи' ? 'Без задачи' : match[1].toUpperCase();
+    if (tasks.has(id)) continue;
+    const maxSummaryLength = 150 - id.length - 2;
+    let summary = match[2].trim();
+    if (summary.length > maxSummaryLength) {
+      const bounded = summary.slice(0, maxSummaryLength + 1).trimEnd();
+      const lastSpace = bounded.lastIndexOf(' ');
+      summary = lastSpace > 0 ? bounded.slice(0, lastSpace) : bounded.slice(0, maxSummaryLength);
+    }
+    tasks.set(id, summary);
+  }
+  if (!tasks.size) throw new Error('Не удалось выделить задачи и их ID из ответа модели. Проверьте историю коммитов.');
+  return [...tasks].map(([id, summary]) => `${id}: ${summary}`).join('\n');
 }
 
 function branchPrefix(branch: string): string {
