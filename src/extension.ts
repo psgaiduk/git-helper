@@ -320,20 +320,86 @@ function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]!);
 }
 
-async function commitsSincePreviousTag(cwd: string): Promise<string> {
-  let previousTag: string | undefined;
+class TagReadinessError extends Error {}
+
+class TagPushError extends Error {
+  constructor(readonly tagName: string, readonly remote: string, message: string) {
+    super(message);
+  }
+}
+
+function folderPath(): string {
+  const folder = vscode.workspace.workspaceFolders?.[0];
+  if (!folder) throw new TagReadinessError('Откройте Git-репозиторий, чтобы создавать теги.');
+  return folder.uri.fsPath;
+}
+
+async function assertMainIsCurrent(cwd: string): Promise<{ remote: string }> {
+  let branchResult: { stdout: string };
   try {
-    const result = await execFileAsync('git', ['describe', '--tags', '--abbrev=0', 'HEAD'], { cwd, maxBuffer: 1024 * 1024 });
-    previousTag = result.stdout.trim();
+    branchResult = await execFileAsync('git', ['branch', '--show-current'], { cwd });
   } catch {
-    // A repository without tags uses its available commit history as the first release range.
+    throw new TagReadinessError('Откройте Git-репозиторий, чтобы создавать теги.');
+  }
+  if (branchResult.stdout.trim() !== 'main') {
+    throw new TagReadinessError('Тег можно создать только из ветки main. Переключитесь на main и обновите код.');
   }
 
-  const range = previousTag ? `${previousTag}..HEAD` : 'HEAD';
+  let remote: string;
+  let mergeRef: string;
+  try {
+    const [remoteResult, mergeResult] = await Promise.all([
+      execFileAsync('git', ['config', '--get', 'branch.main.remote'], { cwd }),
+      execFileAsync('git', ['config', '--get', 'branch.main.merge'], { cwd })
+    ]);
+    remote = remoteResult.stdout.trim();
+    mergeRef = mergeResult.stdout.trim();
+  } catch {
+    throw new TagReadinessError('Для main не настроен upstream remote. Настройте его, обновите код и проверьте снова.');
+  }
+  if (!remote || remote === '.' || mergeRef !== 'refs/heads/main') {
+    throw new TagReadinessError('Ветка main должна отслеживать remote-ветку main. Настройте upstream и проверьте снова.');
+  }
+
+  const remoteTrackingRef = `refs/remotes/${remote}/main`;
+  try {
+    await execFileAsync('git', ['fetch', '--quiet', remote, `+${mergeRef}:${remoteTrackingRef}`], { cwd, maxBuffer: 2 * 1024 * 1024 });
+  } catch {
+    throw new TagReadinessError(`Не удалось проверить ${remote}/main. Проверьте соединение и доступ к remote, затем обновите код.`);
+  }
+
+  let localMain: string;
+  let remoteMain: string;
+  try {
+    const [localResult, remoteResult] = await Promise.all([
+      execFileAsync('git', ['rev-parse', '--verify', 'refs/heads/main^{commit}'], { cwd }),
+      execFileAsync('git', ['rev-parse', '--verify', `${remoteTrackingRef}^{commit}`], { cwd })
+    ]);
+    localMain = localResult.stdout.trim();
+    remoteMain = remoteResult.stdout.trim();
+  } catch {
+    throw new TagReadinessError(`Не удалось сравнить main с ${remote}/main. Обновите код и проверьте снова.`);
+  }
+  if (localMain !== remoteMain) {
+    throw new TagReadinessError(`Локальная main не совпадает с ${remote}/main. Обновите код (git pull --ff-only) и проверьте снова.`);
+  }
+  return { remote };
+}
+
+async function commitsSincePreviousTag(cwd: string, targetRef: string): Promise<string> {
+  let previousTag: string | undefined;
+  try {
+    const result = await execFileAsync('git', ['describe', '--tags', '--abbrev=0', targetRef], { cwd, maxBuffer: 1024 * 1024 });
+    previousTag = result.stdout.trim();
+  } catch {
+    // A repository without tags uses the reachable history of the target branch for its first release.
+  }
+
+  const range = previousTag ? `${previousTag}..${targetRef}` : targetRef;
   const result = await execFileAsync('git', ['log', '--max-count=500', '--decorate=short', '--format=%h%x09%d%x09%s%n%b%n---', range], { cwd, maxBuffer: 8 * 1024 * 1024 });
   const log = result.stdout.trim();
   if (!log) throw new Error('После предыдущего тега нет коммитов для описания.');
-  return `Диапазон: ${previousTag ? `${previousTag}..HEAD` : 'вся история до HEAD'}\n\n${log.slice(0, 60_000)}`;
+  return `Целевая ветка: ${targetRef}\nДиапазон: ${previousTag ? `${previousTag}..${targetRef}` : `вся история ${targetRef}, так как тегов ещё нет`}\n\n${log.slice(0, 60_000)}`;
 }
 
 async function generateTagDescription(commitLog: string, apiKey: string | undefined): Promise<string> {
