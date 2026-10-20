@@ -2,7 +2,7 @@
   "name": "smart-commit-message",
   "displayName": "Smart Commit Message",
   "description": "Generate a concise commit message from staged changes and the current branch.",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "publisher": "local-tools",
   "engines": { "vscode": "^1.85.0" },
   "categories": ["SCM"],
