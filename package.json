@@ -1,0 +1,51 @@
+{
+  "name": "smart-commit-message",
+  "displayName": "Smart Commit Message",
+  "description": "Generate a concise commit message from staged changes and the current branch.",
+  "version": "0.1.0",
+  "publisher": "local-tools",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["SCM"],
+  "activationEvents": ["onCommand:smartCommit.generate", "onView:smartCommit.settingsView"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "smartCommit.generate", "title": "Generate Commit Message", "icon": "$(sparkle)" },
+      { "command": "smartCommit.setApiKey", "title": "Smart Commit Message: Set API Token" },
+      { "command": "smartCommit.openSettings", "title": "Smart Commit Message: Open Settings" }
+    ],
+    "viewsContainers": {
+      "activitybar": [{ "id": "smartCommit", "title": "Smart Commit", "icon": "resources/smart-commit.svg" }]
+    },
+    "views": {
+      "smartCommit": [{ "id": "smartCommit.settingsView", "name": "Generate & Settings", "type": "webview" }]
+    },
+    "menus": {
+      "scm/title": [
+        { "command": "smartCommit.generate", "when": "scmProvider == git", "group": "navigation" }
+      ],
+      "view/title": [{ "command": "smartCommit.openSettings", "when": "view == smartCommit.settingsView", "group": "navigation" }]
+    },
+    "configuration": {
+      "title": "Smart Commit Message",
+      "properties": {
+        "smartCommit.apiUrl": {
+          "type": "string",
+          "default": "https://api.openai.com/v1",
+          "description": "OpenAI API base URL (or an OpenAI-compatible API endpoint)."
+        },
+        "smartCommit.model": {
+          "type": "string",
+          "default": "gpt-4o-mini",
+          "description": "Model name supported by the configured API endpoint."
+        }
+      }
+    }
+  },
+  "scripts": { "vscode:prepublish": "npm run compile", "compile": "tsc -p ./", "watch": "tsc -watch -p ./" },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.3"
+  }
+}
