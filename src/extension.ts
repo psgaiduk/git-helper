@@ -84,24 +84,31 @@ export function activate(context: vscode.ExtensionContext): void {
             try {
               const apiUrl = String(message.apiUrl ?? '').trim();
               const model = String(message.model ?? '').trim();
+              const includeCommitBody = Boolean(message.includeCommitBody);
               if (!apiUrl || !model) throw new Error('Заполните адрес API и название модели.');
               const configuration = vscode.workspace.getConfiguration('smartCommit');
               await configuration.update('apiUrl', apiUrl, vscode.ConfigurationTarget.Global);
               await configuration.update('model', model, vscode.ConfigurationTarget.Global);
+              await configuration.update('includeCommitBody', includeCommitBody, vscode.ConfigurationTarget.Global);
               const savedApiUrl = configuration.inspect<string>('apiUrl')?.globalValue;
               const savedModel = configuration.inspect<string>('model')?.globalValue;
+              const savedIncludeCommitBody = configuration.inspect<boolean>('includeCommitBody')?.globalValue;
               const apiUrlStored = savedApiUrl === apiUrl || (!savedApiUrl && apiUrl === 'https://api.openai.com/v1');
               const modelStored = savedModel === model || (!savedModel && model === 'gpt-4o-mini');
-              if (!apiUrlStored || !modelStored) {
+              const commitBodyStored = savedIncludeCommitBody === includeCommitBody || (savedIncludeCommitBody === undefined && !includeCommitBody);
+              if (!apiUrlStored || !modelStored || !commitBodyStored) {
                 throw new Error('VS Code не подтвердил запись настроек. Проверьте активный профиль и права доступа к пользовательским настройкам.');
               }
               const token = String(message.apiKey ?? '').trim();
               if (token) await context.secrets.store(apiKeyStorageKey, token);
               else if (message.removeApiKey) await context.secrets.delete(apiKeyStorageKey);
-              view.webview.postMessage({ command: 'saved', hasApiKey: token.length > 0 || (!message.removeApiKey && Boolean(await context.secrets.get(apiKeyStorageKey))) });
+              view.webview.postMessage({ command: 'saved', hasApiKey: token.length > 0 || (!message.removeApiKey && Boolean(await context.secrets.get(apiKeyStorageKey))), includeCommitBody });
             } catch (error) {
               const detail = error instanceof Error ? error.message : String(error);
-              view.webview.postMessage({ command: 'saveError', message: detail });
+              const message = /not a registered configuration|не является зарегистрированной конфигурацией/i.test(detail)
+                ? 'Перезапустите Extension Development Host (F5) или переустановите VSIX 0.2.0: текущая копия расширения ещё не загрузила новую настройку.'
+                : detail;
+              view.webview.postMessage({ command: 'saveError', message });
             }
           }
         }, undefined, context.subscriptions);
@@ -167,6 +174,7 @@ function settingsHtml(webview: vscode.Webview, hasApiKey: boolean): string {
   const configuration = vscode.workspace.getConfiguration('smartCommit');
   const apiUrl = escapeHtml(configuration.get<string>('apiUrl', 'https://api.openai.com/v1'));
   const model = escapeHtml(configuration.get<string>('model', 'gpt-4o-mini'));
+  const includeCommitBody = configuration.get<boolean>('includeCommitBody', false);
   const nonce = randomBytes(16).toString('base64');
   return `<!DOCTYPE html>
 <html lang="ru">
@@ -202,6 +210,10 @@ function settingsHtml(webview: vscode.Webview, hasApiKey: boolean): string {
     .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--vscode-descriptionForeground); }
     .dot.saved { background: var(--vscode-testing-iconPassed, #73c991); }
     .hint { margin: 6px 1px 0; color: var(--vscode-descriptionForeground); font-size: 10px; line-height: 1.45; }
+    .check-row { display: flex; align-items: flex-start; gap: 8px; margin: 15px 1px 5px; cursor: pointer; }
+    .check-row input { flex: 0 0 auto; width: 14px; height: 14px; margin: 1px 0 0; accent-color: var(--vscode-focusBorder); }
+    .check-title { font-size: 11px; font-weight: 500; }
+    .check-description { display: block; margin-top: 3px; color: var(--vscode-descriptionForeground); font-size: 10px; font-weight: 400; line-height: 1.4; }
     .secondary { margin-top: 8px; color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); font-weight: 500; }
     .secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
     #status { min-height: 15px; margin: 10px 1px 0; color: var(--vscode-descriptionForeground); font-size: 10px; line-height: 1.4; }
@@ -256,6 +268,10 @@ function settingsHtml(webview: vscode.Webview, hasApiKey: boolean): string {
   <div class="field"><label for="model">Модель</label>
   <input id="model" type="text" value="${model}">
   </div>
+  <label class="check-row" for="includeCommitBody">
+    <input id="includeCommitBody" type="checkbox" ${includeCommitBody ? 'checked' : ''}>
+    <span><span class="check-title">Добавлять описание к коммиту</span><span class="check-description">Добавит подробное тело после заголовка длиной до 80 символов.</span></span>
+  </label>
   <div class="field"><label for="apiKey">API-токен</label>
   <input id="apiKey" type="password" placeholder="${hasApiKey ? 'Введите новый токен для замены' : 'Вставьте токен, если требуется'}" autocomplete="new-password">
   <div class="token-state"><span class="dot ${hasApiKey ? 'saved' : ''}"></span>${hasApiKey ? 'Токен сохранён' : 'Токен не задан'}</div>
@@ -290,11 +306,12 @@ function settingsHtml(webview: vscode.Webview, hasApiKey: boolean): string {
     });
     createTagButton.addEventListener('click', () => { createTagButton.disabled = true; status.textContent = 'Создаём аннотированный тег и отправляем его в remote…'; vscode.postMessage({ command: 'createTag', name: tagName.value, description: tagDescription.value }); });
     document.getElementById('settings').addEventListener('click', () => vscode.postMessage({ command: 'openSettings' }));
-    document.getElementById('save').addEventListener('click', () => { status.textContent = 'Сохраняем в пользовательские настройки…'; vscode.postMessage({ command: 'save', apiUrl: document.getElementById('apiUrl').value, model: document.getElementById('model').value, apiKey: document.getElementById('apiKey').value }); });
-    document.getElementById('removeKey').addEventListener('click', () => { status.textContent = 'Сохраняем настройки…'; vscode.postMessage({ command: 'save', apiUrl: document.getElementById('apiUrl').value, model: document.getElementById('model').value, removeApiKey: true }); });
+    document.getElementById('save').addEventListener('click', () => { status.textContent = 'Сохраняем в пользовательские настройки…'; vscode.postMessage({ command: 'save', apiUrl: document.getElementById('apiUrl').value, model: document.getElementById('model').value, includeCommitBody: document.getElementById('includeCommitBody').checked, apiKey: document.getElementById('apiKey').value }); });
+    document.getElementById('removeKey').addEventListener('click', () => { status.textContent = 'Сохраняем настройки…'; vscode.postMessage({ command: 'save', apiUrl: document.getElementById('apiUrl').value, model: document.getElementById('model').value, includeCommitBody: document.getElementById('includeCommitBody').checked, removeApiKey: true }); });
     window.addEventListener('message', event => {
       if (event.data.command === 'saved') {
         document.getElementById('apiKey').value = '';
+        document.getElementById('includeCommitBody').checked = event.data.includeCommitBody;
         document.querySelector('.token-state').innerHTML = '<span class="dot ' + (event.data.hasApiKey ? 'saved' : '') + '"></span>' + (event.data.hasApiKey ? 'Токен сохранён' : 'Токен не задан');
         status.textContent = 'Настройки сохранены.';
       }
@@ -470,6 +487,7 @@ async function generateMessage(diff: string, prefix: string, apiKey: string | un
   const configuration = vscode.workspace.getConfiguration('smartCommit');
   const apiUrl = configuration.get<string>('apiUrl', 'https://api.openai.com/v1').trim().replace(/\/$/, '');
   const model = configuration.get<string>('model', 'gpt-4o-mini').trim();
+  const includeCommitBody = configuration.get<boolean>('includeCommitBody', false);
   if (!model) throw new Error('Set a model name in Smart Commit Message settings.');
   // Keep requests bounded while preserving the beginning of each staged patch.
   const boundedDiff = diff.length > 60_000 ? `${diff.slice(0, 60_000)}\n[diff truncated]` : diff;
@@ -485,7 +503,9 @@ async function generateMessage(diff: string, prefix: string, apiKey: string | un
       messages: [
         {
           role: 'system',
-          content: `Write one concise commit subject of at most ${maxCommitMessageLength} characters, in English, in this exact format: ${prefix} <type>: <imperative summary>. Choose exactly one type: ${allowedTypes.join(', ')}. feat is a user-facing feature; fix corrects a bug; refactoring restructures code without changing behavior; style is lint/format-only cleanup; devops is deployment/infrastructure work; docs is documentation; test is test-only work. Infer the most fitting type and summary from the staged diff. Return only the subject line, no quotes, markdown, or explanation.`
+          content: includeCommitBody
+            ? `Write a commit message in English. The first line must be a concise subject of at most ${maxCommitMessageLength} characters, in this exact format: ${prefix} <type>: <imperative summary>. Choose exactly one type: ${allowedTypes.join(', ')}. feat is a user-facing feature; fix corrects a bug; refactoring restructures code without changing behavior; style is lint/format-only cleanup; devops is deployment/infrastructure work; docs is documentation; test is test-only work. After the subject, add a blank line and a detailed body explaining what changed and why, based only on the staged diff. Use a few concise paragraphs or bullets as useful. Do not repeat the subject in the body. Return only the commit message, with no quotes or code fences.`
+            : `Write one concise commit subject of at most ${maxCommitMessageLength} characters, in English, in this exact format: ${prefix} <type>: <imperative summary>. Choose exactly one type: ${allowedTypes.join(', ')}. feat is a user-facing feature; fix corrects a bug; refactoring restructures code without changing behavior; style is lint/format-only cleanup; devops is deployment/infrastructure work; docs is documentation; test is test-only work. Infer the most fitting type and summary from the staged diff. Return only the subject line, no quotes, markdown, or explanation.`
         },
         { role: 'user', content: `Staged diff:\n${boundedDiff}` }
       ]
@@ -499,7 +519,9 @@ async function generateMessage(diff: string, prefix: string, apiKey: string | un
   if (!response.ok) {
     throw new Error(payload.error?.message ?? `API returned HTTP ${response.status}`);
   }
-  const line = payload.choices?.[0]?.message?.content?.trim().split(/\r?\n/, 1)[0]?.replace(/^['"`]+|['"`]+$/g, '');
+  const responseText = payload.choices?.[0]?.message?.content?.trim();
+  const [rawLine, ...bodyLines] = responseText?.split(/\r?\n/) ?? [];
+  const line = rawLine?.trim().replace(/^['"`]+|['"`]+$/g, '');
   if (!line) {
     throw new Error('The API returned an empty commit message.');
   }
@@ -509,7 +531,11 @@ async function generateMessage(diff: string, prefix: string, apiKey: string | un
   if (!typeMatch) {
     throw new Error(`The API returned an invalid message: ${normalized}`);
   }
-  return limitCommitMessage(normalized);
+  const subject = limitCommitMessage(normalized);
+  if (!includeCommitBody) return subject;
+  const body = bodyLines.join('\n').trim();
+  if (!body) throw new Error('The API returned a commit subject without the requested description.');
+  return `${subject}\n\n${body}`;
 }
 
 function limitCommitMessage(message: string): string {
